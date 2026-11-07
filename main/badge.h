@@ -39,20 +39,20 @@ int btn_held(void); // buttons held right now: bit (1 << BTN_x) set while presse
 void wifi_on(void);                 // radio on, station mode, no network joined (ESP-NOW apps: set the channel next)
 bool wifi_connect(int timeout_ms); // wifi_on + join the saved Wi-Fi ("ssid"/"pass"); true once there is an IP
 void wifi_off(void);                // radio off
-// Ranging (Radar and any app): badges running badge os find each other (ESP-NOW beacons, channel 1) and measure
-// their distance with Wi-Fi FTM; each badge shares its own ranges, so you also get the distances between others.
-// The OS starts it at boot and keeps it on (APSTA, hidden SoftAP as the FTM responder, ESP-NOW on channel 1), so
+// Ranging (Radar and any app): BBFT v2 ESP-NOW beacons on channel 6 discover Hackaday badges and C3 ftm_node.
+// Distances use Wi-Fi FTM; raw results are shared, then corrected and median-filtered locally.
+// The OS starts it at boot and keeps it on (APSTA, hidden SoftAP as the FTM responder, ESP-NOW on channel 6), so
 // apps just call ranging_get. ranging_start/ranging_stop exist for apps that stopped it.
 // Don't use ESP-NOW yourself while it runs; wifi_on/wifi_connect stop it first.
 typedef struct {
     uint8_t a[6], b[6]; // a measured b; a = ranging_me() for this badge's own ranges
-    int16_t cm;         // distance, -1 = b heard but not measured yet; FTM: ~1-2 m typical error, 5-10 m outliers
+    int32_t cm;         // distance, -1 = b heard but no fresh result; centimetres (not limited to 327.67 m)
     uint32_t age_ms;    // age of cm (or of the last beacon while cm is -1)
 } range_t;
 void ranging_start(void);
 void ranging_stop(void);
-int ranging_get(range_t *out, int max); // pairs heard of in the last 30 s; returns how many it wrote
-void ranging_me(uint8_t mac[6]);        // this badge's id: its Wi-Fi station MAC (what other badges list it as)
+int ranging_get(range_t *out, int max); // fresh measurements (<30 s) and unmeasured live peers (<10 s)
+void ranging_me(uint8_t mac[6]);        // this badge's id: its Wi-Fi SoftAP MAC (also its ESP-NOW sender)
 bool ranging_name(const uint8_t mac[6], char name[13]); // that badge's username from Settings, false if none (yet)
 void badge_id(char id[5]); // this badge's 4-hex-digit id, e.g. "9FCC": the last two bytes of ranging_me()
 
@@ -63,6 +63,8 @@ void badge_id(char id[5]); // this badge's 4-hex-digit id, e.g. "9FCC": the last
 // online with Open-Meteo geocoding and saves the result), "wx_lat", "wx_lon" (Weather, decimal degrees as text;
 // default Pasadena when unset), "wx_place" (Weather: the looked-up "Name, Country" for display), "wx_unit"
 // ("F" = Fahrenheit and mph; anything else or unset = Celsius and km/h).
+// Ranging calibration (programmatic cfg_set): "rng_badge_cm" / "rng_node_cm", initiator bias in cm,
+// defaults 190 / 0, matching Hackaday's lib/ranging.py. These are not fields in the phone settings form.
 int cfg_get(const char *key, char *out, int n);
 bool cfg_set(const char *key, const char *val);
 // The Badge app's picture: W x (H - TOP) pixels, 1 bit, same layout as fb (1 = black), IMG_BYTES bytes.

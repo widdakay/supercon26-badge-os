@@ -1,5 +1,9 @@
 # Radar: what the badge can do (phase 1 research)
 
+**Historical design research.** The implementation now uses BBFT v2 on channel 6, AP MAC identities,
+raw RANGE broadcasts and median filtering. The BOSR/channel-1 proposal below is superseded; see
+[README.md](README.md#ranging-compatibility) and [main/bbft.h](main/bbft.h) for the current protocol.
+
 Goal: show other badge os badges nearby: who, how far, and if possible which direction.
 Hardware facts: ESP32-S3-WROOM-1 (module PCB antenna, 2.4 GHz only), no IMU, no compass (DEVICE_INFO.md).
 Optional AS5600 knob on an SAO port. ESP-IDF v6.0.2. "Checked" = read in the local IDF tree; "[n]" = source list at the end.

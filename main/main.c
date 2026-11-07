@@ -24,6 +24,8 @@
 #include "esp_random.h"
 #include "freertos/semphr.h"
 #include <stddef.h>
+#include <math.h>
+#include "bbft.h"
 #include "usb/usb_host.h"
 #include "freertos/event_groups.h"
 #include "esp_timer.h"
@@ -551,7 +553,9 @@ int btn_held(void) { return held; }
 #define WIFI_PASS ""
 #endif
 static EventGroupHandle_t wifi_ev; // bit 0: got an IP, bit 1: an FTM report (ranging)
-static volatile int ftm_cm;        // last FTM result in cm, -1 failed
+static wifi_event_ftm_report_t ftm_report;
+static volatile bool ftm_pending;
+static uint8_t ftm_peer[6];
 static volatile bool wifi_join;    // keep (re)joining the badge Wi-Fi
 
 static void on_wifi(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -560,9 +564,11 @@ static void on_wifi(void *arg, esp_event_base_t base, int32_t id, void *data)
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) xEventGroupClearBits(wifi_ev, 1);
     if (base == WIFI_EVENT && id == WIFI_EVENT_FTM_REPORT) { // ranging: one FTM session done
         wifi_event_ftm_report_t *r = data;
-        ftm_cm = r->status == FTM_STATUS_SUCCESS ? (int)r->dist_est : -1;
-        ESP_LOGI(TAG, "ftm %02x%02x: status %d, rtt %u ns, %u cm", r->peer_mac[4], r->peer_mac[5], r->status,
-                 (unsigned)r->rtt_est, (unsigned)r->dist_est);
+        if (!ftm_pending || memcmp(r->peer_mac, ftm_peer, 6)) {
+            esp_wifi_ftm_get_report(NULL, 0); // late result from a cancelled session
+            return;
+        }
+        ftm_report = *r;
         xEventGroupSetBits(wifi_ev, 2);
     }
     if (base == WIFI_EVENT && (id == WIFI_EVENT_STA_START || id == WIFI_EVENT_STA_DISCONNECTED) && wifi_join)
@@ -611,40 +617,31 @@ void wifi_off(void)
     xEventGroupClearBits(wifi_ev, 1);
 }
 
-// ---- Ranging: badges running badge os find each other with ESP-NOW beacons on channel 1 and measure distances with
-// Wi-Fi FTM (802.11mc round-trip time). Each beacon carries the sender's own ranges, so every badge also learns the
-// distances between the others. The OS starts it at boot; it needs Wi-Fi in APSTA mode, the hidden SoftAP being this
-// badge's FTM responder, so wifi_on/wifi_connect/wifi_off stop it. Background: RADAR_RESEARCH.md.
-#define RNG_CH 1
-#define RNG_FRAMES 16       // FTM frames per session (API: 0, 16, 24, 32, 64): two bursts of 8
-#define RNG_OFFSET_CM 0     // what FTM reads at 0 m, subtracted: 0 on our badges (checked side by side)
-#define RNG_KEEP 32         // ranges kept, own and shared
-#define RNG_SHARE 8         // own ranges per beacon
-#define RNG_STALE_US 30000000LL // a pair not heard of for 30 s is dropped
+// ---- Ranging: BBFT v2 on channel 6, interoperable with Hackaday badges and C3 ftm_node.
+// All identities (including ESP-NOW senders) are SoftAP MACs. Only raw results go on air;
+// the median and initiator bias are display-side, just as in lib/ranging.py upstream.
+#define RNG_KEEP 64
+#define RNG_FRAMES 16
 
-typedef struct __attribute__((packed)) {
-    char magic[4]; // "BOSR"
-    uint8_t ap[6]; // the sender's SoftAP MAC: where to aim FTM
-    uint8_t n;
-    struct __attribute__((packed)) {
-        uint8_t mac[6];
-        int16_t cm;
-    } r[RNG_SHARE];
-} rng_beacon_t;
-
-// a -> b. Own entries (a = me) also keep b's SoftAP MAC and the last 4 FTM results (the minimum is the best guess:
-// multipath only ever makes the path longer).
 static struct {
-    uint8_t a[6], b[6], ap[6];
-    char name[13]; // own entries: b's username from its beacon, "" if none
-    int16_t cm, hist[4];
-    int64_t seen, at; // last beacon about this pair, last distance
+    uint8_t a[6], b[6];
+    char name[17]; // own entries: b's BBFT name (16 wire bytes plus terminator)
+    int8_t rssi;
+    bbft_history_t history;
+    int64_t seen; // own: last packet from b; shared: last result from a about b
 } rng[RNG_KEEP];
 static uint8_t rng_me[6];
-static SemaphoreHandle_t rng_lock, rng_done;
+static SemaphoreHandle_t rng_lock, rng_done, rng_rx_done;
+static QueueHandle_t rng_rxq;
 static volatile bool rng_run;
+static double rng_badge_bias_cm, rng_node_bias_cm;
 
-static int rng_slot(const uint8_t *a, const uint8_t *b) // under rng_lock: the entry for a -> b, else the oldest, reset
+typedef struct {
+    uint8_t src[6], len, data[64];
+    int8_t rssi;
+} rng_packet_t;
+
+static int rng_slot(const uint8_t *a, const uint8_t *b) // under rng_lock
 {
     int old = 0;
     for (int i = 0; i < RNG_KEEP; i++) {
@@ -653,87 +650,166 @@ static int rng_slot(const uint8_t *a, const uint8_t *b) // under rng_lock: the e
     }
     memset(&rng[old], 0, sizeof rng[old]);
     memcpy(rng[old].a, a, 6), memcpy(rng[old].b, b, 6);
-    rng[old].cm = rng[old].hist[0] = rng[old].hist[1] = rng[old].hist[2] = rng[old].hist[3] = -1;
     return old;
 }
 
-static void rng_recv(const esp_now_recv_info_t *info, const uint8_t *d, int len)
+static double rng_bias(const uint8_t *mac) // under rng_lock; upstream identifies C3 nodes by name
 {
-    const rng_beacon_t *m = (const void *)d;
-    int head = offsetof(rng_beacon_t, r);
-    if (len < head || memcmp(m->magic, "BOSR", 4) || m->n > RNG_SHARE || len < head + m->n * (int)sizeof m->r[0]) return;
-    int64_t now = esp_timer_get_time();
-    xSemaphoreTake(rng_lock, portMAX_DELAY);
-    int i = rng_slot(rng_me, info->src_addr); // a badge nearby: range it
-    if (!rng[i].seen) ESP_LOGI(TAG, "ranging: new badge %02x%02x", info->src_addr[4], info->src_addr[5]);
-    memcpy(rng[i].ap, m->ap, 6);
-    rng[i].seen = now;
-    int tail = head + m->n * (int)sizeof m->r[0]; // the username follows the ranges (badges before v0.7 send none)
-    if (len >= tail + 12) memcpy(rng[i].name, d + tail, 12), rng[i].name[12] = 0;
-    for (int k = 0; k < m->n; k++) { // what it measured
-        int j = rng_slot(info->src_addr, m->r[k].mac);
-        rng[j].cm = m->r[k].cm, rng[j].seen = rng[j].at = now;
+    for (int i = 0; i < RNG_KEEP; i++)
+        if (!memcmp(rng[i].a, rng_me, 6) && !memcmp(rng[i].b, mac, 6) &&
+            !strncmp(rng[i].name, "node-", 5)) return rng_node_bias_cm;
+    return rng_badge_bias_cm;
+}
+
+static double rng_setting(const char *key, double fallback)
+{
+    char s[24], *end;
+    if (cfg_get(key, s, sizeof s) <= 0) return fallback;
+    double v = strtod(s, &end);
+    return *end || !isfinite(v) || fabs(v) > 100000 ? fallback : v;
+}
+
+// The Wi-Fi callback never waits on a mutex: hand packets to a worker.
+static void rng_recv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
+{
+    if (len < 0 || len > 64 || !bbft_type(data, len)) return;
+    rng_packet_t p = {.len = len, .rssi = info->rx_ctrl ? info->rx_ctrl->rssi : 0};
+    memcpy(p.src, info->src_addr, 6);
+    memcpy(p.data, data, len);
+    xQueueSend(rng_rxq, &p, 0);
+}
+
+static void rng_rx_task(void *arg)
+{
+    rng_packet_t p;
+    while (rng_run) {
+        if (!xQueueReceive(rng_rxq, &p, pdMS_TO_TICKS(100))) continue;
+        if (!memcmp(p.src, rng_me, 6)) continue;
+        int type = bbft_type(p.data, p.len);
+        int64_t now = esp_timer_get_time();
+        xSemaphoreTake(rng_lock, portMAX_DELAY);
+        int i = rng_slot(rng_me, p.src);
+        rng[i].seen = now, rng[i].rssi = p.rssi;
+        if (type == BBFT_BEACON) {
+            bbft_beacon_t m;
+            memcpy(&m, p.data, sizeof m);
+            memcpy(rng[i].name, m.name, 16);
+            rng[i].name[16] = 0;
+        } else if (type == BBFT_RANGE) {
+            bbft_range_t m;
+            memcpy(&m, p.data, sizeof m);
+            // Only retain successful directed measurements; do not let a peer
+            // replace this badge's own measurements or insert a self-edge.
+            if (m.range.status == FTM_STATUS_SUCCESS && memcmp(p.src, m.to, 6)) {
+                i = rng_slot(p.src, m.to);
+                rng[i].seen = now;
+                bbft_record(&rng[i].history, &m.range, now);
+            }
+        }
+        // SYNC is recognized for presence; firefly LEDs are not implemented here.
+        xSemaphoreGive(rng_lock);
     }
-    xSemaphoreGive(rng_lock);
+    xSemaphoreGive(rng_rx_done);
+    vTaskDelete(NULL);
+}
+
+// Match ftm_node's per-frame statistics and free the driver's report buffer.
+static void rng_frame_stats(uint8_t count, bbft_result_t *out)
+{
+    wifi_ftm_report_entry_t entries[64];
+    int n = MIN(count, 64);
+    if (!n || esp_wifi_ftm_get_report(entries, n) != ESP_OK) {
+        esp_wifi_ftm_get_report(NULL, 0);
+        return;
+    }
+    uint32_t rtt[64];
+    uint64_t sum = 0;
+    int valid = 0;
+    for (int i = 0; i < n; i++) {
+        uint32_t v = entries[i].rtt;
+        if (v == UINT32_MAX) continue;
+        sum += v;
+        int j = valid++;
+        for (; j > 0 && rtt[j - 1] > v; j--) rtt[j] = rtt[j - 1];
+        rtt[j] = v;
+    }
+    out->entries = valid;
+    if (!valid) return;
+    out->rtt_med_ps = valid & 1 ? rtt[valid / 2] :
+        ((uint64_t)rtt[valid / 2 - 1] + rtt[valid / 2]) / 2;
+    out->rtt_mean_ps = sum / valid;
+    out->rtt_min_ps = rtt[0], out->rtt_max_ps = rtt[valid - 1];
 }
 
 static void rng_task(void *arg)
 {
     static const uint8_t all[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
     int64_t beacon = 0;
+    uint32_t seq = 0;
     for (int next = 0; rng_run;) {
         int64_t now = esp_timer_get_time();
         if (now >= beacon) {
-            static uint8_t buf[sizeof(rng_beacon_t) + 12];
-            rng_beacon_t m = {.magic = {'B', 'O', 'S', 'R'}};
-            esp_wifi_get_mac(WIFI_IF_AP, m.ap);
-            xSemaphoreTake(rng_lock, portMAX_DELAY);
-            for (int i = 0; i < RNG_KEEP && m.n < RNG_SHARE; i++)
-                if (!memcmp(rng[i].a, rng_me, 6) && rng[i].cm >= 0 && now - rng[i].at < RNG_STALE_US)
-                    memcpy(m.r[m.n].mac, rng[i].b, 6), m.r[m.n++].cm = rng[i].cm;
-            xSemaphoreGive(rng_lock);
-            int len = offsetof(rng_beacon_t, r) + m.n * sizeof m.r[0];
+            bbft_beacon_t m = {.hdr = bbft_header(BBFT_BEACON), .seq = ++seq};
             char name[13] = "";
             cfg_get("name", name, sizeof name);
-            memcpy(buf, &m, len);
-            memcpy(buf + len, name, 12); // username, zero padded
-            esp_now_send(all, buf, len + 12);
-            beacon = now + 800000 + esp_random() % 400000; // ~1 s, jittered so two badges do not keep colliding
+            if (*name) memcpy(m.name, name, strlen(name));
+            else snprintf(m.name, sizeof m.name, "badge-%02X%02X", rng_me[4], rng_me[5]);
+            esp_now_send(all, (const uint8_t *)&m, sizeof m);
+            beacon = now + 1000000;
         }
-        // FTM to the next badge heard from in the last 10 s, round robin
-        uint8_t b[6], ap[6];
+        uint8_t peer[6];
+        int8_t rssi = 0;
         int found = -1;
         xSemaphoreTake(rng_lock, portMAX_DELAY);
         for (int k = 0; k < RNG_KEEP && found < 0; k++) {
             int i = (next + k) % RNG_KEEP;
-            if (!memcmp(rng[i].a, rng_me, 6) && now - rng[i].seen < 10000000) found = i, memcpy(b, rng[i].b, 6), memcpy(ap, rng[i].ap, 6);
+            if (rng[i].seen && !memcmp(rng[i].a, rng_me, 6) && now - rng[i].seen < BBFT_PEER_US) {
+                found = i;
+                memcpy(peer, rng[i].b, 6);
+                rssi = rng[i].rssi;
+            }
         }
         xSemaphoreGive(rng_lock);
         if (found < 0) {
-            ms(100);
+            ms(50);
             continue;
         }
         next = found + 1;
-        wifi_ftm_initiator_cfg_t cfg = {.channel = RNG_CH, .frm_count = RNG_FRAMES, .burst_period = 2};
-        memcpy(cfg.resp_mac, ap, 6);
+        wifi_ftm_initiator_cfg_t cfg = {.channel = BBFT_CHANNEL, .frm_count = RNG_FRAMES,
+                                      .burst_period = 0, .use_get_report_api = true};
+        memcpy(cfg.resp_mac, peer, 6);
+        memcpy(ftm_peer, peer, 6);
         xEventGroupClearBits(wifi_ev, 2);
+        ftm_pending = true;
         esp_err_t e = esp_wifi_ftm_initiate_session(&cfg);
-        if (e != ESP_OK) ESP_LOGW(TAG, "ftm %02x%02x: start failed: %s", ap[4], ap[5], esp_err_to_name(e));
-        if (e == ESP_OK &&
-            (xEventGroupWaitBits(wifi_ev, 2, true, true, pdMS_TO_TICKS(2000)) & 2) && ftm_cm >= 0) {
-            xSemaphoreTake(rng_lock, portMAX_DELAY);
-            int i = rng_slot(rng_me, b), cm = MAX(0, ftm_cm - RNG_OFFSET_CM);
-            memmove(rng[i].hist + 1, rng[i].hist, 3 * sizeof rng[i].hist[0]);
-            rng[i].hist[0] = cm;
-            for (int k = 1; k < 4; k++)
-                if (rng[i].hist[k] >= 0) cm = MIN(cm, rng[i].hist[k]);
-            rng[i].cm = cm, rng[i].at = esp_timer_get_time();
-            if (!rng[i].seen) rng[i].seen = rng[i].at;
-            xSemaphoreGive(rng_lock);
-        } else {
-            esp_wifi_ftm_end_session();
+        if (e != ESP_OK) {
+            ftm_pending = false;
+            ESP_LOGW(TAG, "FTM start: %s", esp_err_to_name(e));
+            ms(20);
+            continue;
         }
-        ms(50 + esp_random() % 100); // air for the other badges' bursts
+        if (!(xEventGroupWaitBits(wifi_ev, 2, true, true, pdMS_TO_TICKS(1000)) & 2)) {
+            ftm_pending = false;
+            esp_wifi_ftm_end_session();
+            continue;
+        }
+        ftm_pending = false;
+        wifi_event_ftm_report_t report = ftm_report;
+        bbft_range_t m = {.hdr = bbft_header(BBFT_RANGE)};
+        memcpy(m.to, peer, 6);
+        m.range.status = report.status, m.range.entries = report.ftm_report_num_entries;
+        m.range.rssi = rssi, m.range.dist_cm = report.dist_est;
+        m.range.rtt_raw_ns = report.rtt_raw, m.range.rtt_est_ns = report.rtt_est;
+        rng_frame_stats(report.ftm_report_num_entries, &m.range);
+        if (m.range.status == FTM_STATUS_SUCCESS) {
+            xSemaphoreTake(rng_lock, portMAX_DELAY);
+            int i = rng_slot(rng_me, peer);
+            bbft_record(&rng[i].history, &m.range, esp_timer_get_time());
+            xSemaphoreGive(rng_lock);
+        }
+        // Broadcast raw statistics, never the bias-corrected display value.
+        esp_now_send(all, (const uint8_t *)&m, sizeof m);
+        ms(1);
     }
     xSemaphoreGive(rng_done);
     vTaskDelete(NULL);
@@ -742,34 +818,50 @@ static void rng_task(void *arg)
 void ranging_start(void)
 {
     if (rng_run) return;
-    if (!rng_lock) rng_lock = xSemaphoreCreateMutex(), rng_done = xSemaphoreCreateBinary();
+    if (!rng_lock) {
+        rng_lock = xSemaphoreCreateMutex();
+        rng_done = xSemaphoreCreateBinary(), rng_rx_done = xSemaphoreCreateBinary();
+        rng_rxq = xQueueCreate(32, sizeof(rng_packet_t));
+    }
+    // Same defaults as Hackaday lib/ranging.py, in centimetres; adjustable through NVS.
+    rng_badge_bias_cm = rng_setting("rng_badge_cm", 190);
+    rng_node_bias_cm = rng_setting("rng_node_cm", 0);
+    wifi_join = false;
     wifi_on();
+    esp_wifi_disconnect();
     esp_wifi_stop();
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
-    wifi_config_t ap = {.ap = {.ssid = "badge-os", .ssid_len = 8, .channel = RNG_CH, .authmode = WIFI_AUTH_OPEN,
+    wifi_config_t ap = {.ap = {.ssid = "badge-os", .ssid_len = 8, .channel = BBFT_CHANNEL, .authmode = WIFI_AUTH_OPEN,
                                .ssid_hidden = 1, .max_connection = 1, .beacon_interval = 100, .ftm_responder = true}};
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap));
     ESP_ERROR_CHECK(esp_wifi_start());
-    esp_wifi_set_ps(WIFI_PS_NONE); // modem sleep would drop beacons
-    esp_wifi_set_channel(RNG_CH, WIFI_SECOND_CHAN_NONE);
-    esp_read_mac(rng_me, ESP_MAC_WIFI_STA);
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    esp_wifi_set_channel(BBFT_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    esp_read_mac(rng_me, ESP_MAC_WIFI_SOFTAP);
+    xSemaphoreTake(rng_lock, portMAX_DELAY);
     memset(rng, 0, sizeof rng);
+    xSemaphoreGive(rng_lock);
+    xQueueReset(rng_rxq);
     ESP_ERROR_CHECK(esp_now_init());
-    esp_now_register_recv_cb(rng_recv);
-    esp_now_add_peer(&(esp_now_peer_info_t){.peer_addr = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, .channel = RNG_CH,
-                                            .ifidx = WIFI_IF_STA});
+    ESP_ERROR_CHECK(esp_now_add_peer(&(esp_now_peer_info_t){.peer_addr = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},
+                                                          .channel = BBFT_CHANNEL, .ifidx = WIFI_IF_AP}));
     rng_run = true;
-    xTaskCreate(rng_task, "ranging", 4096, NULL, 4, NULL);
+    ESP_ERROR_CHECK(esp_now_register_recv_cb(rng_recv));
+    xTaskCreate(rng_rx_task, "ranging_rx", 4096, NULL, 4, NULL);
+    xTaskCreate(rng_task, "ranging", 8192, NULL, 4, NULL);
 }
 
 void ranging_stop(void)
 {
     if (!rng_run) return;
     rng_run = false;
-    xSemaphoreTake(rng_done, pdMS_TO_TICKS(5000));
+    // Wait for both workers before changing the radio or clearing the queue.
+    xSemaphoreTake(rng_done, portMAX_DELAY);
+    esp_now_unregister_recv_cb();
+    xSemaphoreTake(rng_rx_done, portMAX_DELAY);
     esp_now_deinit();
     esp_wifi_stop();
-    esp_wifi_set_mode(WIFI_MODE_STA); // as wifi_on() left it
+    esp_wifi_set_mode(WIFI_MODE_STA);
 }
 
 int ranging_get(range_t *out, int max)
@@ -779,16 +871,19 @@ int ranging_get(range_t *out, int max)
     int64_t now = esp_timer_get_time();
     xSemaphoreTake(rng_lock, portMAX_DELAY);
     for (int i = 0; i < RNG_KEEP && n < max; i++) {
-        if (!rng[i].seen || now - rng[i].seen > RNG_STALE_US) continue;
+        if (!rng[i].seen) continue;
+        int32_t cm = bbft_distance(&rng[i].history, rng_bias(rng[i].a), now);
+        bool own = !memcmp(rng[i].a, rng_me, 6);
+        if (cm < 0 && (!own || now - rng[i].seen >= BBFT_PEER_US)) continue;
         memcpy(out[n].a, rng[i].a, 6), memcpy(out[n].b, rng[i].b, 6);
-        out[n].cm = rng[i].cm;
-        out[n++].age_ms = (now - (rng[i].cm >= 0 ? rng[i].at : rng[i].seen)) / 1000;
+        out[n].cm = cm;
+        out[n++].age_ms = (now - (cm >= 0 ? rng[i].history.at[0] : rng[i].seen)) / 1000;
     }
     xSemaphoreGive(rng_lock);
     return n;
 }
 
-void ranging_me(uint8_t mac[6]) { esp_read_mac(mac, ESP_MAC_WIFI_STA); }
+void ranging_me(uint8_t mac[6]) { esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP); }
 
 bool ranging_name(const uint8_t mac[6], char name[13])
 {
@@ -797,7 +892,8 @@ bool ranging_name(const uint8_t mac[6], char name[13])
     if (!rng_lock) return false;
     xSemaphoreTake(rng_lock, portMAX_DELAY);
     for (int i = 0; i < RNG_KEEP && !ok; i++)
-        if (!memcmp(rng[i].a, rng_me, 6) && !memcmp(rng[i].b, mac, 6) && rng[i].name[0]) strcpy(name, rng[i].name), ok = true;
+        if (!memcmp(rng[i].a, rng_me, 6) && !memcmp(rng[i].b, mac, 6) && rng[i].name[0])
+            snprintf(name, 13, "%.12s", rng[i].name), ok = true;
     xSemaphoreGive(rng_lock);
     return ok;
 }
@@ -805,8 +901,8 @@ bool ranging_name(const uint8_t mac[6], char name[13])
 void badge_id(char id[5])
 {
     uint8_t mac[6];
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    sprintf(id, "%02X%02X", mac[4], mac[5]); // as Radar shows it
+    ranging_me(mac);
+    sprintf(id, "%02X%02X", mac[4], mac[5]);
 }
 
 // ---- Settings (the Settings app writes them): short strings in NVS namespace "cfg"; the Badge app's picture

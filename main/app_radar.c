@@ -1,4 +1,4 @@
-// Radar: badges running badge os nearby, by id (last 4 hex digits of the MAC) and distance (OS ranging, Wi-Fi FTM).
+// Radar: BBFT v2 badges and C3 nodes nearby, by name/AP MAC id and distance (OS ranging, Wi-Fi FTM).
 // With 2+ measured badges (3 with this one) it also draws a 2D map centred on this badge, fitted to every shared distance.
 // No compass: the map's rotation and mirror are arbitrary (kept steady between frames).
 #include <math.h>
